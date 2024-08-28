@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "power-v2"
+version = "0.1.0"
+description = ""
+authors = ["Tim <timothee@timwin.fr>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+stravalib = "^2.0"
+nicegui = {extras = ["highcharts"], version = "^1.4.36"}
+scipy = "^1.13.1"
+jax = "^0.4.31"
+gpxpy = "^1.6.2"
+geopy = "^2.4.1"
+matplotlib = "^3.9.2"
+jaxopt = "^0.8.3"
+diffrax = "^0.6.0"
+optax = "^0.2.3"
+
+
+[tool.poetry.group.dev.dependencies]
+ipython = "^8.26.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
