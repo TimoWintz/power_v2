@@ -1,6 +1,7 @@
 from functools import partial
 from power_v2.track import Segment, Track
 from power_v2.model import ResistanceModel, RiderModel
+from power_v2.optim import power_to_speed
 from dataclasses import dataclass
 import numpy as np
 from typing import Optional, Any, Union
@@ -105,7 +106,7 @@ def drag_force(
 
     air_resistance_force = air_resistance_coef * abs(v + wind_speed) * (v + wind_speed)
     total_resistance = air_resistance_force + rolling_resistance_force
-    return -total_resistance
+    return total_resistance
 
 
 def dk_dx(
@@ -200,7 +201,8 @@ def f_speed(
     max_steps: int = 10000,
 ):
     dt0 = distance[-1] / (max_steps - 1)
-    term = lambda x, k, _: dk_dx(x, k, power=force, distance=distance, elevation=elevation, wind_speed=wind_speed, rolling_resistance=rolling_resistance, air_resistance_coef=air_resistance_coef, total_mass=total_mass)
+    saveat = 0.5*(distance[1:] + distance[:-1])
+    term = lambda x, k, _: dk_dx(x, k, force=force, distance=distance, elevation=elevation, wind_speed=wind_speed, rolling_resistance=rolling_resistance, air_resistance_coef=air_resistance_coef, total_mass=total_mass)
     term = ODETerm(term)
     y0 = 0.5 * total_mass  * start_speed ** 2
     solution = diffeqsolve(
@@ -211,7 +213,7 @@ def f_speed(
         dt0=dt0,
         y0=y0,
         max_steps=max_steps,
-        saveat=diffrax.SaveAt(ts=distance),
+        saveat=diffrax.SaveAt(ts=saveat),
     )
     return jnp.sqrt(2 * solution.ys.flatten() / total_mass)
 
@@ -282,38 +284,32 @@ class PowerOptimizer:
                 )
                 * self.resistance_model.cda_m2
             )
-        root_finder = optx.Chord(rtol=1e-3, atol=1e-3)
-        #self.solver = diffrax.Kvaerno5(root_finder=root_finder)
-        self.step_size = 5
+        self.step_size = 10
         self.solver = diffrax.Heun()
 
-    def f_constraint(self, power):
-        speed = self.f_speed(power)
-        duration = self.length_m / (0.5 * (speed[:-1] + speed[1:]))
+    def f_constraint(self, force):
+        speed = self.f_speed(force)
+        power = speed * force
+        duration = self.length_m / speed
         anaerobic_capacity = self.f_anaerobic_capacity_with_duration(
             power,
             duration,
         )
-        return anaerobic_capacity.min() / self.rider_model.critical_power_w
-        max_avg_power = self.f_max_power(
-            duration,
-            anaerobic_capacity,
-        )
-        return jnp.concatenate([anaerobic_capacity, max_avg_power - power])
+        max_power = self.f_max_power(duration, anaerobic_capacity)
+        return jnp.concatenate(
+            (anaerobic_capacity / self.rider_model.critical_power_w,
+            (max_power - power)/self.max_power)).min()
 
-    def f_total_time(
-        self,
-        power: jnp.ndarray,
-    ):
-        speed = self.f_speed(power)
-        duration = self.length_m / (0.5 * (speed[:-1] + speed[1:]))
-        return duration.sum()
+    
+    def f_anaerobic_capacity_with_duration(self, power, duration):
+        return f_anaerobic_capacity_with_duration(power, duration, self.anaerobic_work_capacity, self.anaerobic_work_capacity, self.critical_power)
+    
+    def f_max_power(self, duration, wp_bal):
+        return f_max_power(duration, wp_bal, self.max_power, self.anaerobic_work_capacity, self.critical_power)
 
-    def test_speed_model(self):
-        print("Test speed model...")
-        power = self.rider_model.critical_power_w * jnp.ones(self.num_points)
-        self.f_speed =            lambda power: f_speed(
-                power,
+    def f_speed(self, force):
+        return f_speed(
+                force,
                 np.array([0]),
                 self.distance_m,
                 self.elevation_m,
@@ -324,40 +320,40 @@ class PowerOptimizer:
                 max_steps=int(self.distance_m[-1] / self.step_size),
                 solver=self.solver,
             )
-        
-        speed = self.f_speed(power)
-        print(f"Done. Average speed={speed.mean()},({speed.min(), speed.max()})")
-        self.grad_total_time = grad(self.f_total_time)
-        self.f_anaerobic_capacity_with_duration = (
-            lambda power, duration: f_anaerobic_capacity_with_duration(
-                power,
-                duration,
-                self.anaerobic_work_capacity,
-                self.anaerobic_work_capacity,
-                self.critical_power,
-            )
-        )
 
-        self.f_max_power = lambda duration, anaerobic_capacity: f_max_power(
-            duration,
-            anaerobic_capacity,
-            self.max_power,
-            self.anaerobic_work_capacity,
-            self.critical_power,
-        )
+    def f_total_time(
+        self,
+        power: jnp.ndarray,
+    ):
+        speed = self.f_speed(power)
+        duration = self.length_m / speed
+        return duration.sum()
+
+    def get_initial_force(self):
+        initial_power = self.rider_model.critical_power_w * np.ones(self.num_points - 1)
+        initial_speed = power_to_speed(initial_power, self.air_resistance_coef, self.wind_speed, GRAVITY_ACCELERATION * np.diff(self.elevation_m) / np.diff(self.distance_m), self.resistance_model.drivetrain_efficiency, self.rolling_resistance)
+        initial_force = initial_power / initial_speed
+        return initial_force
+
+    def test_speed_model(self):
+        print("Test speed model...")
+        force = self.get_initial_force()        
+        speed = self.f_speed(force)
+        print(f"Done. Average speed={speed.mean()},({speed.min(), speed.max()})")
 
     def compute(self):
         self.test_speed_model()
-        print("Minimizing time...")
-        initial_power = self.rider_model.critical_power_w * np.ones(self.num_points - 1)
+        print(f"JIT compiling functions")
+        initial_force = self.get_initial_force()
 
         f_total_time = jit(self.f_total_time)
         g_total_time = grad(f_total_time)
         f_constraint = jit(self.f_constraint)
         g_constraint = grad(f_constraint)
-        x = initial_power
+        x = initial_force
 
         g_total_time(x)
+        g_constraint(x)
 
         nl_constraint = NonlinearConstraint(
             f_constraint,
@@ -366,39 +362,25 @@ class PowerOptimizer:
             jac=g_constraint,
             hess=BFGS(),
         )
-        bounds = Bounds(lb=0, ub=self.rider_model.max_power_w) # use force as input
+
+        print("Minimizing time...")
         minimizer = minimize(
             f_total_time,
             x0=x,
             jac=g_total_time,
             constraints=[nl_constraint],
-            bounds=bounds,
         )
 
-        obj = jit(
-            lambda x: self.f_total_time(x)
-            + jax.nn.leaky_relu(-self.f_constraint(x), 0.001).sum()
-        )
-        grad_obj = grad(obj)
-        step_size = self.rider_model.anaerobic_reserve_j / current_val
-        current_val = f_total_time(x)
-        for _ in range(40):
-            print(f"{step_size=}")
-            print(f"t={f_total_time(x)}")
-            print(f"pen={f_constraint(x)}")
-            g = grad_obj(x)
-            x = x - step_size * g / np.abs(g).max()
-
-            step_size = step_size * 0.95
-
-        speed = self.f_speed(x)
-
-        duration = self.length_m / (0.5 * (speed[:-1] + speed[1:]))
-        wp_bal = self.f_anaerobic_capacity_with_duration(x, duration)
+       
+        force = minimizer.x
+        speed = self.f_speed(force)
+        power = speed * force
+        duration = self.length_m / speed
+        wp_bal = self.f_anaerobic_capacity_with_duration(power, duration)
 
         print("Done")
         self.track.data = {
-            "power/optimal": x,
+            "power/optimal": power,
             "wp_bal/optimal": wp_bal,
             "speed/optimal": speed,
         }

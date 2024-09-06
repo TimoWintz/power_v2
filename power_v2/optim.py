@@ -8,7 +8,7 @@ from scipy.optimize import minimize, NonlinearConstraint, Bounds, fmin
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
 
-from jax import numpy as np
+from jax import numpy as jnp
 GRAVITY_ACCELERATION = 9.81
 
 
@@ -37,7 +37,7 @@ def speed_to_power(
     wind_speed: np.ndarray,
     gravity_force: np.ndarray,
     efficiency: float,
-    rolling_resistance: float,
+    rolling_resistance: np.ndarray,
     mass_times_acceleration: Union[np.ndarray, float] = 0,
 ) -> np.ndarray:
     air_resistance_force = (
@@ -90,7 +90,7 @@ def power_to_speed(
                 wind_speed[i],
                 gravity_force[i],
                 efficiency,
-                rolling_resistance,
+                rolling_resistance[i],
             )
             for i in range(len(power))
         ]
