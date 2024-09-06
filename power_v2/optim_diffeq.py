@@ -22,7 +22,8 @@ import diffrax
 from jax import jacfwd, jacobian, hessian
 import optimistix as optx
 import jax
-
+from optax import lbfgs
+import optax
 jax.config.update("jax_enable_x64", True)
 
 # from jax.scipy.optimize import minimize
@@ -345,34 +346,22 @@ class PowerOptimizer:
         self.test_speed_model()
         print(f"JIT compiling functions")
         initial_force = self.get_initial_force()
+        f = lambda x: self.f_total_time(x) + len(self.distance_m) * self.f_constraint(x)
 
-        f_total_time = jit(self.f_total_time)
-        g_total_time = grad(f_total_time)
-        f_constraint = jit(self.f_constraint)
-        g_constraint = grad(f_constraint)
-        x = initial_force
-
-        g_total_time(x)
-        g_constraint(x)
-
-        nl_constraint = NonlinearConstraint(
-            f_constraint,
-            lb=0,
-            ub=self.rider_model.anaerobic_reserve_j / self.rider_model.critical_power_w,
-            jac=g_constraint,
-            hess=BFGS(),
-        )
-
-        print("Minimizing time...")
-        minimizer = minimize(
-            f_total_time,
-            x0=x,
-            jac=g_total_time,
-            constraints=[nl_constraint],
-        )
-
+        solver = lbfgs()
+        
+        value_and_grad = optax.value_and_grad_from_state(f)
+        params = initial_force
+        opt_state = solver.init(params)
+        for _ in range(5):
+            value, grad = value_and_grad(params, state=opt_state)
+            updates, opt_state = solver.update(
+                grad, opt_state, params, value=value, grad=grad, value_fn=f
+            )
+            params = optax.apply_updates(params, updates)
+            print('Objective function: ', f(params))
        
-        force = minimizer.x
+        force = params
         speed = self.f_speed(force)
         power = speed * force
         duration = self.length_m / speed
