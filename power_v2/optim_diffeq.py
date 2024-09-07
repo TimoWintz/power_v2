@@ -13,6 +13,7 @@ from scipy.optimize import (
     approx_fprime,
     BFGS,
 )
+import equinox as eqx
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
 from diffrax import diffeqsolve, ODETerm, Dopri5, Tsit5, Kvaerno3, ImplicitEuler, Euler
@@ -24,7 +25,6 @@ import optimistix as optx
 import jax
 from optax import lbfgs
 import optax
-jax.config.update("jax_enable_x64", True)
 
 # from jax.scipy.optimize import minimize
 GRAVITY_ACCELERATION = 9.81
@@ -48,45 +48,13 @@ def air_density(altitude_m: float, temperature_C: float) -> float:
     return pressure_pa / temperature_K / R_air
 
 
-grad_interp = grad(jnp.interp)
-
-
-def dz_dx(x: jnp.ndarray, distance: np.ndarray, elevation: np.ndarray):
-    dz = np.diff(elevation) / np.diff(distance)
+def f_search_array(x: jnp.ndarray, distance: np.ndarray, array: np.ndarray):
     x = jax.lax.stop_gradient(x)
-    index = jnp.searchsorted(distance, x, side="right")
-    return jnp.take(dz, index - 1, mode="clip")
+    index = jnp.searchsorted(distance, x)
+    return jnp.take(array, index - 1, mode="clip")
 
 
-def f_force(x: jnp.ndarray, distance: np.ndarray, force: np.ndarray):
-    x = jax.lax.stop_gradient(x)
-    index = jnp.searchsorted(distance, x, side="right")
-    return jnp.take(force, index - 1, mode="clip")
-
-
-def f_wind_speed(x: jnp.ndarray, distance: np.ndarray, wind_speed: np.ndarray):
-    x = jax.lax.stop_gradient(x)
-    index = jnp.searchsorted(distance, x, side="right")
-    return jnp.take(wind_speed, index - 1, mode="clip")
-
-
-def f_rolling_resistance(
-    x: jnp.ndarray, distance: np.ndarray, rolling_resistance: np.ndarray
-):
-    x = jax.lax.stop_gradient(x)
-    index = jnp.searchsorted(distance, x, side="right")
-    return jnp.take(rolling_resistance, index - 1, mode="clip")
-
-
-def f_air_resistance_coef(
-    x: jnp.ndarray, distance: np.ndarray, air_resistance_coef: np.ndarray
-):
-    x = jax.lax.stop_gradient(x)
-    index = jnp.searchsorted(distance, x, side="right")
-    return jnp.take(air_resistance_coef, index - 1, mode="clip")
-
-
-def drag_force(
+def f_drag_force(
     x: jnp.ndarray,
     v: jnp.ndarray,
 
@@ -95,42 +63,46 @@ def drag_force(
     rolling_resistance: np.ndarray,
     air_resistance_coef: np.ndarray,
 ):
-    wind_speed = f_wind_speed(x, distance=distance, wind_speed=wind_speed)
-    rolling_resistance_force = f_rolling_resistance(
+    wind_speed = f_search_array(x, distance=distance, array=wind_speed)
+    rolling_resistance_force = f_search_array(
         x,
         distance=distance,
-        rolling_resistance=rolling_resistance,
+        array=rolling_resistance,
     )
-    air_resistance_coef = f_air_resistance_coef(
-        x, distance=distance, air_resistance_coef=air_resistance_coef
+    air_resistance_coef = f_search_array(
+        x, distance=distance, array=air_resistance_coef
     )
-
     air_resistance_force = air_resistance_coef * abs(v + wind_speed) * (v + wind_speed)
     total_resistance = air_resistance_force + rolling_resistance_force
     return total_resistance
 
-
+@jit
 def dk_dx(
     x: jnp.ndarray,
     k: jnp.ndarray,
-    force: jnp.ndarray,
+    rider_force: jnp.ndarray,
     distance: np.ndarray,
-    elevation: np.ndarray,
+    dz_dx: np.ndarray,
     wind_speed: np.ndarray,
     rolling_resistance: np.ndarray,
     air_resistance_coef: np.ndarray,
     total_mass: np.ndarray,
 ):
-    v = jnp.sqrt(2 * k / total_mass)
-    val_drag_force = drag_force(
+    v = jnp.sqrt(2 * jnp.clip(k, 0, None) / total_mass)
+    
+    val_drag_force = f_drag_force(
         x, v, distance, wind_speed, rolling_resistance, air_resistance_coef
     )
-    in_force = f_force(x, distance, force)
-    val_dz_dx = dz_dx(x, distance, elevation)
-    return (
-        in_force
-        - val_drag_force - jnp.sin(val_dz_dx) * GRAVITY_ACCELERATION * total_mass
+    val_rider_force = f_search_array(x, distance, array=rider_force)
+    val_dz_dx = f_search_array(x, distance, array=dz_dx)
+    val_gravity_force = GRAVITY_ACCELERATION * val_dz_dx * total_mass
+
+
+    total_force = (
+        val_rider_force
+        - val_drag_force - val_gravity_force
     )
+    return total_force
 
 def update_anaerobic_capacity(
     power: float,
@@ -180,43 +152,45 @@ def f_max_power(
     critical_power: np.ndarray,
 ):
     assert len(anaerobic_capacity) == len(duration) + 1
+    anaerobic_capacity = jnp.clip(anaerobic_capacity, 0, None)
     max_power_ = (
         critical_power
         + (max_power - critical_power)
         / ((max_power - critical_power) * duration + anaerobic_work_capacity)
         * anaerobic_capacity[:-1]
     )
-    return jnp.clip(max_power_, 0, None)
+    return max_power_
 
-
+#@partial(jit, static_argnums=(8,))
 def f_speed(
     force: jnp.ndarray,
     start_speed: np.ndarray,
     distance: np.ndarray,
-    elevation: np.ndarray,
+    dz_dx: np.ndarray,
     wind_speed: np.ndarray,
     rolling_resistance: np.ndarray,
     air_resistance_coef: np.ndarray,
     total_mass: np.ndarray,
-    solver,
-    max_steps: int = 10000,
+    step_factor: int,
 ):
-    dt0 = distance[-1] / (max_steps - 1)
-    saveat = 0.5*(distance[1:] + distance[:-1])
-    term = lambda x, k, _: dk_dx(x, k, force=force, distance=distance, elevation=elevation, wind_speed=wind_speed, rolling_resistance=rolling_resistance, air_resistance_coef=air_resistance_coef, total_mass=total_mass)
-    term = ODETerm(term)
-    y0 = 0.5 * total_mass  * start_speed ** 2
-    solution = diffeqsolve(
-        term,
-        solver,
-        t0=0,
-        t1=distance[-1],
-        dt0=dt0,
-        y0=y0,
-        max_steps=max_steps,
-        saveat=diffrax.SaveAt(ts=saveat),
-    )
-    return jnp.sqrt(2 * solution.ys.flatten() / total_mass)
+    x_vals = jnp.linspace(0, distance[-1], (len(distance) - 1) * step_factor + 1)
+    
+    def dk(x, k):
+        return dk_dx(x, k, rider_force=force,
+                                 distance=distance,
+                                 dz_dx=dz_dx,
+                                 wind_speed=wind_speed,
+                                 rolling_resistance=rolling_resistance, air_resistance_coef=air_resistance_coef, total_mass=total_mass)
+    k_vals = [0.5 * total_mass  * start_speed ** 2]
+    for i in range(1, len(x_vals)):
+        k_vals.append(k_vals[i-1] + (x_vals[i] - x_vals[i-1]) * dk(x_vals[i-1], k_vals[i-1]))
+    k_vals = jnp.asarray(k_vals)
+    speed = jnp.sqrt(2 * k_vals.flatten() / total_mass)
+    duration = jnp.diff(x_vals)/ (0.5 * (speed[:-1] + speed[1:]))
+    time = jnp.pad(jnp.cumsum(duration), (1,0))
+    return jnp.diff(x_vals[::step_factor]) / jnp.diff(time[::step_factor])
+
+    
 
 
 @dataclass
@@ -226,6 +200,8 @@ class PowerOptimizer:
     resistance_model: ResistanceModel
     rider_model: RiderModel
     standing_start: bool
+
+    step_size: int = 10
 
     def get_wind_speed(
         self,
@@ -250,11 +226,12 @@ class PowerOptimizer:
         self.length_m = np.diff(self.distance_m)
         self.segment_length_m = self.get_segment_length()
         self.segment_distance_m = np.cumsum(self.segment_length_m)
-        idx_segment = np.searchsorted(self.segment_distance_m, self.track.distance_m)
 
-        self.wind_speed = np.zeros(self.num_points)
-        self.rolling_resistance = np.zeros(self.num_points)
-        self.air_resistance_coef = np.zeros(self.num_points)
+        idx_segment = np.searchsorted(self.segment_distance_m, self.track.distance_m[1:])
+        self.wind_speed = np.zeros(len(idx_segment))
+        self.rolling_resistance = np.zeros(len(idx_segment))
+        self.air_resistance_coef = np.zeros(len(idx_segment))
+        self.dz_dx = np.diff(self.elevation_m) / np.diff(self.distance_m)
 
         self.anaerobic_work_capacity = np.asarray(
             [self.rider_model.anaerobic_reserve_j]
@@ -264,15 +241,14 @@ class PowerOptimizer:
 
         for i, seg_i in enumerate(idx_segment):
             seg = self.segments[seg_i]
-            if i < len(idx_segment) - 1:
-                self.wind_speed[i] = self.get_wind_speed(
-                    self.track.points[i],
-                    self.track.points[i + 1],
-                    kmh_to_ms(seg.weather_model.wind_speed_kmh),
-                    seg.weather_model.wind_angle_rad,
-                )
-            else:
-                self.wind_speed[i] = self.wind_speed[i - 1]
+           
+            self.wind_speed[i] = self.get_wind_speed(
+                self.track.points[i],
+                self.track.points[i + 1],
+                kmh_to_ms(seg.weather_model.wind_speed_kmh),
+                seg.weather_model.wind_angle_rad,
+            )
+    
             self.rolling_resistance[i] = (
                 self.resistance_model.crr
                 * self.resistance_model.total_mass_kg
@@ -285,10 +261,13 @@ class PowerOptimizer:
                 )
                 * self.resistance_model.cda_m2
             )
-        self.step_size = 10
-        self.solver = diffrax.Heun()
+        
+        self.step_factor = self.track.precision_m // self.step_size
+        self.solver = diffrax.Euler()
+        
 
-    def f_constraint(self, force):
+    def f_obj(self, force, args):
+        alpha, beta = args
         speed = self.f_speed(force)
         power = speed * force
         duration = self.length_m / speed
@@ -297,9 +276,14 @@ class PowerOptimizer:
             duration,
         )
         max_power = self.f_max_power(duration, anaerobic_capacity)
-        return jnp.concatenate(
-            (anaerobic_capacity / self.rider_model.critical_power_w,
-            (max_power - power)/self.max_power)).min()
+        total_time = jnp.reshape(duration.sum(), (1,))
+        min_anaerobic_capacity = jnp.reshape((anaerobic_capacity / self.rider_model.critical_power_w).min(), (1,))
+        max_extra_power = jnp.reshape(jnp.clip((max_power - power)/self.max_power, None, 0).min(),(1,))
+
+        return jnp.concatenate((
+            total_time,
+            alpha * min_anaerobic_capacity,
+            beta * max_extra_power))
 
     
     def f_anaerobic_capacity_with_duration(self, power, duration):
@@ -313,57 +297,73 @@ class PowerOptimizer:
                 force,
                 np.array([0]),
                 self.distance_m,
-                self.elevation_m,
+                self.dz_dx,
                 self.wind_speed,
                 self.rolling_resistance,
                 self.air_resistance_coef,
                 self.total_mass,
-                max_steps=int(self.distance_m[-1] / self.step_size),
-                solver=self.solver,
+                step_factor=self.step_factor
             )
 
     def f_total_time(
         self,
-        power: jnp.ndarray,
+        force: jnp.ndarray,
     ):
-        speed = self.f_speed(power)
+        speed = self.f_speed(force)
         duration = self.length_m / speed
         return duration.sum()
+    
+    def get_min_force(self):
+        rider_force = np.zeros_like(self.length_m)
+        k = np.sqrt(2 * np.ones_like(self.length_m) / self.total_mass)
+        pt = 0.5 * (self.distance_m[:-1] + self.distance_m[1:])
+        dk_dx_ = dk_dx(pt, k, rider_force, self.distance_m, self.dz_dx, self.wind_speed, self.rolling_resistance, self.air_resistance_coef, self.total_mass)
+        return np.clip(-dk_dx_, 0, None)
+    
 
-    def get_initial_force(self):
-        initial_power = self.rider_model.critical_power_w * np.ones(self.num_points - 1)
-        initial_speed = power_to_speed(initial_power, self.air_resistance_coef, self.wind_speed, GRAVITY_ACCELERATION * np.diff(self.elevation_m) / np.diff(self.distance_m), self.resistance_model.drivetrain_efficiency, self.rolling_resistance)
-        initial_force = initial_power / initial_speed
-        return initial_force
+    def setup_solvers(self, y):
+        print("Setting up solvers...")
+        options={"jac":"bwd"}
+        self.args=(500, 500)
+        solver = optx.LevenbergMarquardt(rtol=1e-2, atol=1e-2)
+        f_struct = jax.ShapeDtypeStruct((3,), jnp.float32)
+        aux_struct = None
+        # Any Lineax tags describing the structure of the Jacobian matrix d(fn)/dy.
+        # (In this case it's just a 1x1 matrix, so these don't matter.)
+        tags = frozenset()
 
-    def test_speed_model(self):
-        print("Test speed model...")
-        force = self.get_initial_force()        
-        speed = self.f_speed(force)
-        print(f"Done. Average speed={speed.mean()},({speed.min(), speed.max()})")
+        self.fn_obj = eqx.filter_jit(lambda x, args: (self.f_obj(x, args), None))
+      
+        # These arguments are always fixed throughout interactive solves.
+        self.step = eqx.filter_jit(
+            eqx.Partial(solver.step, fn=self.fn_obj, args=self.args, options=options, tags=tags)
+        )
+        self.state = solver.init(self.fn_obj, y, self.args, options, f_struct, aux_struct, tags)
+        print("Done. Initial state:")
+        self.print_state(y)
+        
+
+    def print_state(self, y):
+        val = self.fn_obj(y, self.args)
+        print(f"Force: {y} with total time {val[0][0]}.")
+        print(f"Constraint: {val[0][1:]}")
 
     def compute(self):
-        self.test_speed_model()
-        print(f"JIT compiling functions")
-        initial_force = self.get_initial_force()
-        f = lambda x: self.f_total_time(x) + len(self.distance_m) * self.f_constraint(x)
+        initial_force = self.get_min_force()
+        speed = self.f_speed(initial_force)
+        self.setup_solvers(initial_force)
+                
+        y = initial_force
+        for _ in range(10):
+            print("STEP: Minimizing time")
+            y, self.state, aux = self.step(y=y, state=self.state)
+            self.print_state(y)
+            
 
-        solver = lbfgs()
-        
-        value_and_grad = optax.value_and_grad_from_state(f)
-        params = initial_force
-        opt_state = solver.init(params)
-        for _ in range(5):
-            value, grad = value_and_grad(params, state=opt_state)
-            updates, opt_state = solver.update(
-                grad, opt_state, params, value=value, grad=grad, value_fn=f
-            )
-            params = optax.apply_updates(params, updates)
-            print('Objective function: ', f(params))
        
-        force = params
+        force = y
         speed = self.f_speed(force)
-        power = speed * force
+        power = speed * force / self.resistance_model.drivetrain_efficiency
         duration = self.length_m / speed
         wp_bal = self.f_anaerobic_capacity_with_duration(power, duration)
 
